@@ -73,11 +73,11 @@ def search_phenotypes(query: str, max_results: int = 50) -> List[Dict]:
     """Search phenotypes with semantic reranking."""
     try:
         # First get results from HDR UK API
-        api_results = client.phenotypes.get(search=query)
-        
+        api_results = list(client.phenotypes.get(search=query))
+
         if not api_results:
             return []
-        
+
         # Limit to max_results for semantic reranking
         api_results = api_results[:max_results]
         

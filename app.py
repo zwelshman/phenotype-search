@@ -163,34 +163,34 @@ def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) 
         st.error(f"Error in semantic search: {str(e)}")
         return valid_phenotypes[:top_k] if valid_phenotypes else []
 
-def extract_coding_systems(phenotypes: List[Dict]) -> List[str]:
-    """Extract unique coding systems from phenotypes, handling various data types."""
-    coding_systems = set()
+def extract_data_sources(phenotypes: List[Dict]) -> List[str]:
+    """Extract unique data sources from phenotypes, handling various data types."""
+    data_sources = set()
 
     for phenotype in phenotypes:
         if not isinstance(phenotype, dict):
             continue
 
-        coding_system = phenotype.get('coding_system')
-        if not coding_system:
+        data_source = phenotype.get('data_sources')
+        if not data_source:
             continue
 
         # Handle different types
-        if isinstance(coding_system, str):
-            coding_systems.add(coding_system)
-        elif isinstance(coding_system, list):
-            for cs in coding_system:
-                if isinstance(cs, str):
-                    coding_systems.add(cs)
-                elif isinstance(cs, dict) and 'name' in cs:
-                    coding_systems.add(cs['name'])
-        elif isinstance(coding_system, dict):
-            if 'name' in coding_system:
-                coding_systems.add(coding_system['name'])
+        if isinstance(data_source, str):
+            data_sources.add(data_source)
+        elif isinstance(data_source, list):
+            for ds in data_source:
+                if isinstance(ds, str):
+                    data_sources.add(ds)
+                elif isinstance(ds, dict) and 'name' in ds:
+                    data_sources.add(ds['name'])
+        elif isinstance(data_source, dict):
+            if 'name' in data_source:
+                data_sources.add(data_source['name'])
             else:
-                coding_systems.add(str(coding_system))
+                data_sources.add(str(data_source))
 
-    return sorted(list(coding_systems))
+    return sorted(list(data_sources))
 
 def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[Dict]:
     """Search phenotypes with optional filters."""
@@ -223,27 +223,27 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
             st.warning("No valid phenotype objects found in API response")
             return []
 
-        # Apply client-side coding system filter if specified
-        if filters and filters.get('coding_system'):
-            filter_coding_system = filters['coding_system']
+        # Apply client-side data sources filter if specified
+        if filters and filters.get('data_sources'):
+            filter_data_source = filters['data_sources']
             filtered_results = []
             for r in valid_results:
-                coding_system = r.get('coding_system')
-                if coding_system:
+                data_sources = r.get('data_sources')
+                if data_sources:
                     # Check if the filter matches
                     match = False
-                    if isinstance(coding_system, str):
-                        match = (coding_system == filter_coding_system)
-                    elif isinstance(coding_system, list):
-                        for cs in coding_system:
-                            if isinstance(cs, str) and cs == filter_coding_system:
+                    if isinstance(data_sources, str):
+                        match = (data_sources == filter_data_source)
+                    elif isinstance(data_sources, list):
+                        for ds in data_sources:
+                            if isinstance(ds, str) and ds == filter_data_source:
                                 match = True
                                 break
-                            elif isinstance(cs, dict) and cs.get('name') == filter_coding_system:
+                            elif isinstance(ds, dict) and ds.get('name') == filter_data_source:
                                 match = True
                                 break
-                    elif isinstance(coding_system, dict):
-                        match = (coding_system.get('name') == filter_coding_system)
+                    elif isinstance(data_sources, dict):
+                        match = (data_sources.get('name') == filter_data_source)
 
                     if match:
                         filtered_results.append(r)
@@ -454,17 +454,17 @@ with st.sidebar:
             except Exception:
                 st.session_state.all_phenotypes = []
 
-    # Extract unique coding systems
-    available_coding_systems = ["All"]
+    # Extract unique data sources
+    available_data_sources = ["All"]
     if st.session_state.all_phenotypes:
-        coding_systems = extract_coding_systems(st.session_state.all_phenotypes)
-        available_coding_systems.extend(coding_systems)
+        data_sources = extract_data_sources(st.session_state.all_phenotypes)
+        available_data_sources.extend(data_sources)
 
     data_source_filter = st.selectbox(
-        "Data Source (Coding System)",
-        available_coding_systems,
+        "Data Source",
+        available_data_sources,
         index=0,
-        help="Filter by the coding system used (e.g., SNOMED CT, ICD-10)"
+        help="Filter by the data source"
     )
 
     st.markdown("---")
@@ -533,7 +533,7 @@ if search_button and query:
         if phenotype_type_filter != "All":
             filters['phenotype_type'] = phenotype_type_filter
         if data_source_filter != "All":
-            filters['coding_system'] = data_source_filter
+            filters['data_sources'] = data_source_filter
 
         results = search_phenotypes(query, client, model, filters)
         st.session_state.search_results = results[:max_results]

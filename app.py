@@ -163,6 +163,35 @@ def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) 
         st.error(f"Error in semantic search: {str(e)}")
         return valid_phenotypes[:top_k] if valid_phenotypes else []
 
+def extract_coding_systems(phenotypes: List[Dict]) -> List[str]:
+    """Extract unique coding systems from phenotypes, handling various data types."""
+    coding_systems = set()
+
+    for phenotype in phenotypes:
+        if not isinstance(phenotype, dict):
+            continue
+
+        coding_system = phenotype.get('coding_system')
+        if not coding_system:
+            continue
+
+        # Handle different types
+        if isinstance(coding_system, str):
+            coding_systems.add(coding_system)
+        elif isinstance(coding_system, list):
+            for cs in coding_system:
+                if isinstance(cs, str):
+                    coding_systems.add(cs)
+                elif isinstance(cs, dict) and 'name' in cs:
+                    coding_systems.add(cs['name'])
+        elif isinstance(coding_system, dict):
+            if 'name' in coding_system:
+                coding_systems.add(coding_system['name'])
+            else:
+                coding_systems.add(str(coding_system))
+
+    return sorted(list(coding_systems))
+
 def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[Dict]:
     """Search phenotypes with optional filters."""
     try:
@@ -193,6 +222,32 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
         if not valid_results:
             st.warning("No valid phenotype objects found in API response")
             return []
+
+        # Apply client-side coding system filter if specified
+        if filters and filters.get('coding_system'):
+            filter_coding_system = filters['coding_system']
+            filtered_results = []
+            for r in valid_results:
+                coding_system = r.get('coding_system')
+                if coding_system:
+                    # Check if the filter matches
+                    match = False
+                    if isinstance(coding_system, str):
+                        match = (coding_system == filter_coding_system)
+                    elif isinstance(coding_system, list):
+                        for cs in coding_system:
+                            if isinstance(cs, str) and cs == filter_coding_system:
+                                match = True
+                                break
+                            elif isinstance(cs, dict) and cs.get('name') == filter_coding_system:
+                                match = True
+                                break
+                    elif isinstance(coding_system, dict):
+                        match = (coding_system.get('name') == filter_coding_system)
+
+                    if match:
+                        filtered_results.append(r)
+            valid_results = filtered_results
 
         # Apply semantic reranking
         reranked = semantic_search(query, valid_results, model, top_k=30)
@@ -389,6 +444,29 @@ with st.sidebar:
         index=0
     )
 
+    # Load all phenotypes once to get available coding systems
+    if st.session_state.all_phenotypes is None:
+        with st.spinner("Loading available data sources..."):
+            try:
+                all_phens = client.phenotypes.get(no_pagination=True)
+                if isinstance(all_phens, list):
+                    st.session_state.all_phenotypes = all_phens
+            except Exception:
+                st.session_state.all_phenotypes = []
+
+    # Extract unique coding systems
+    available_coding_systems = ["All"]
+    if st.session_state.all_phenotypes:
+        coding_systems = extract_coding_systems(st.session_state.all_phenotypes)
+        available_coding_systems.extend(coding_systems)
+
+    data_source_filter = st.selectbox(
+        "Data Source (Coding System)",
+        available_coding_systems,
+        index=0,
+        help="Filter by the coding system used (e.g., SNOMED CT, ICD-10)"
+    )
+
     st.markdown("---")
     st.header("ℹ️ About")
     st.markdown("""
@@ -454,6 +532,8 @@ if search_button and query:
         filters = {}
         if phenotype_type_filter != "All":
             filters['phenotype_type'] = phenotype_type_filter
+        if data_source_filter != "All":
+            filters['coding_system'] = data_source_filter
 
         results = search_phenotypes(query, client, model, filters)
         st.session_state.search_results = results[:max_results]
@@ -512,13 +592,42 @@ if st.session_state.search_results:
                 if combined_codes:
                     combined_df = pd.concat(combined_codes, ignore_index=True)
 
-                    # Remove duplicates based on code
+                    # Identify duplicates before removing them
+                    duplicate_info = {}
                     if 'code' in combined_df.columns:
+                        # Group by code to find duplicates
+                        code_groups = combined_df.groupby('code')
+
+                        # Track which codes appear in multiple phenotypes
+                        for code, group in code_groups:
+                            if len(group) > 1:
+                                # This code appears in multiple phenotypes
+                                source_names = group['source_phenotype_name'].unique()
+                                duplicate_info[code] = {
+                                    'count': len(group),
+                                    'sources': list(source_names)
+                                }
+
+                        # Add duplicate indicator column before deduplication
+                        combined_df['is_duplicate'] = combined_df['code'].apply(
+                            lambda x: '⚠️ Duplicate' if x in duplicate_info else ''
+                        )
+                        combined_df['appears_in'] = combined_df['code'].apply(
+                            lambda x: ', '.join(duplicate_info[x]['sources'][:3]) +
+                                     (f' (+{len(duplicate_info[x]["sources"])-3} more)' if len(duplicate_info[x]['sources']) > 3 else '')
+                                     if x in duplicate_info else combined_df[combined_df['code'] == x]['source_phenotype_name'].iloc[0]
+                        )
+
+                        # Now remove duplicates, keeping the first occurrence
                         original_count = len(combined_df)
                         combined_df = combined_df.drop_duplicates(subset=['code'], keep='first')
                         dedup_count = original_count - len(combined_df)
 
-                        st.success(f"✅ Combined {len(combined_df)} unique codes (removed {dedup_count} duplicates)")
+                        if duplicate_info:
+                            st.success(f"✅ Combined {len(combined_df)} unique codes (removed {dedup_count} duplicates)")
+                            st.info(f"ℹ️ Found {len(duplicate_info)} codes that appear in multiple phenotypes (highlighted with ⚠️)")
+                        else:
+                            st.success(f"✅ Combined {len(combined_df)} unique codes (no duplicates found)")
                     else:
                         st.success(f"✅ Combined {len(combined_df)} codes")
 
@@ -537,8 +646,19 @@ if st.session_state.search_results:
                         if 'source_phenotype_id' in combined_df.columns:
                             st.metric("Unique Sources", combined_df['source_phenotype_id'].nunique())
 
-                    # Preview
-                    st.dataframe(combined_df.head(50), use_container_width=True)
+                    # Preview with highlighting for duplicates
+                    st.markdown("**Preview (first 50 codes):**")
+
+                    # Create a styled dataframe highlighting duplicates
+                    def highlight_duplicates(row):
+                        if row.get('is_duplicate') == '⚠️ Duplicate':
+                            return ['background-color: #fff3cd'] * len(row)
+                        return [''] * len(row)
+
+                    # Apply styling and display
+                    preview_df = combined_df.head(50)
+                    styled_df = preview_df.style.apply(highlight_duplicates, axis=1)
+                    st.dataframe(styled_df, use_container_width=True)
 
                     # Download
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

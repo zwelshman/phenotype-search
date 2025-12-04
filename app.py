@@ -223,11 +223,14 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
             st.warning("No valid phenotype objects found in API response")
             return []
 
-        # Apply client-side data sources filter if specified
+        # Apply semantic reranking on all results first
+        reranked = semantic_search(query, valid_results, model, top_k=30)
+
+        # Apply client-side data sources filter if specified (after semantic search)
         if filters and filters.get('data_sources'):
             filter_data_source = filters['data_sources']
             filtered_results = []
-            for r in valid_results:
+            for r in reranked:
                 data_sources = r.get('data_sources')
                 if data_sources:
                     # Check if the filter matches
@@ -247,10 +250,7 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
 
                     if match:
                         filtered_results.append(r)
-            valid_results = filtered_results
-
-        # Apply semantic reranking
-        reranked = semantic_search(query, valid_results, model, top_k=30)
+            reranked = filtered_results
 
         return reranked
 

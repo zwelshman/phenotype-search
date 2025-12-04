@@ -530,7 +530,9 @@ if st.session_state.search_results:
                         st.metric("Source Phenotypes", len(st.session_state.selected_phenotypes))
                     with col3:
                         if 'coding_system' in combined_df.columns:
-                            st.metric("Coding Systems", combined_df['coding_system'].nunique())
+                            # Convert to string to handle unhashable types (dicts/lists)
+                            coding_systems = combined_df['coding_system'].apply(lambda x: str(x) if x is not None else 'Unknown')
+                            st.metric("Coding Systems", coding_systems.nunique())
                     with col4:
                         if 'source_phenotype_id' in combined_df.columns:
                             st.metric("Unique Sources", combined_df['source_phenotype_id'].nunique())

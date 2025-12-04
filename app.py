@@ -1,318 +1,517 @@
 import streamlit as st
 import pandas as pd
 from pyconceptlibraryclient import Client
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 import io
 from datetime import datetime
-
-# Initialize session state
-if 'search_results' not in st.session_state:
-    st.session_state.search_results = []
-if 'selected_phenotypes' not in st.session_state:
-    st.session_state.selected_phenotypes = set()
-if 'embedding_model' not in st.session_state:
-    with st.spinner('Loading embedding model (first time only)...'):
-        st.session_state.embedding_model = SentenceTransformer('BAAI/llm-embedder')
+import traceback
 
 # Page config
 st.set_page_config(
     page_title="HDR UK Phenotype Search",
     page_icon="🔬",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🔬 HDR UK Phenotype Library Search")
-st.markdown("Search for phenotypes using natural language queries and download or combine codelists")
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .phenotype-card {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #ddd;
+        margin-bottom: 1rem;
+        background-color: #f8f9fa;
+    }
+    .similarity-badge {
+        display: inline-block;
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.25rem;
+        background-color: #28a745;
+        color: white;
+        font-weight: bold;
+        font-size: 0.875rem;
+    }
+    .stExpander {
+        border: 1px solid #dee2e6;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+def init_session_state():
+    """Initialize all session state variables."""
+    if 'search_results' not in st.session_state:
+        st.session_state.search_results = []
+    if 'selected_phenotypes' not in st.session_state:
+        st.session_state.selected_phenotypes = {}
+    if 'all_phenotypes' not in st.session_state:
+        st.session_state.all_phenotypes = None
+    if 'last_query' not in st.session_state:
+        st.session_state.last_query = ""
+
+init_session_state()
+
+# Load embedding model (lighter and faster)
+@st.cache_resource
+def load_embedding_model():
+    """Load a lightweight embedding model for semantic search."""
+    try:
+        return SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception as e:
+        st.error(f"Failed to load embedding model: {str(e)}")
+        return None
 
 # Initialize HDR UK client
 @st.cache_resource
 def get_hdr_client():
-    """Get authenticated HDR UK client."""
-    return Client(public=True, url="https://phenotypes.healthdatagateway.org/")
-
-client = get_hdr_client()
+    """Get authenticated HDR UK Phenotype Library client."""
+    try:
+        return Client(public=True, url="https://phenotypes.healthdatagateway.org/")
+    except Exception as e:
+        st.error(f"Failed to connect to HDR UK Phenotype Library: {str(e)}")
+        return None
 
 def create_searchable_text(phenotype: Dict) -> str:
-    """Create rich text for semantic search."""
-    parts = [
-        phenotype.get('name', ''),
-        phenotype.get('description', ''),
-        phenotype.get('phenotype_type', ''),
-        ' '.join(phenotype.get('author', [])) if phenotype.get('author') else '',
-        phenotype.get('coding_system', ''),
-    ]
+    """Create rich text for semantic search from phenotype metadata."""
+    parts = []
+
+    # Core fields
+    if phenotype.get('name'):
+        parts.append(phenotype['name'])
+    if phenotype.get('description'):
+        parts.append(phenotype['description'])
+
+    # Metadata
+    if phenotype.get('phenotype_type'):
+        parts.append(f"Type: {phenotype['phenotype_type']}")
+    if phenotype.get('coding_system'):
+        parts.append(f"Coding: {phenotype['coding_system']}")
+
+    # Authors
+    if phenotype.get('author'):
+        authors = phenotype['author']
+        if isinstance(authors, list):
+            parts.append(' '.join(authors))
+        else:
+            parts.append(str(authors))
+
+    # Collections
+    if phenotype.get('collections'):
+        collections = phenotype['collections']
+        if isinstance(collections, list):
+            for c in collections:
+                if isinstance(c, dict) and c.get('name'):
+                    parts.append(c['name'])
+                elif isinstance(c, str):
+                    parts.append(c)
+
+    # Tags
+    if phenotype.get('tags'):
+        tags = phenotype['tags']
+        if isinstance(tags, list):
+            parts.extend([str(t) for t in tags])
+
     return ' '.join(filter(None, parts))
 
-def semantic_rerank(query: str, results: List[Dict], top_k: int = 20) -> List[Dict]:
-    """Rerank results using semantic similarity."""
-    if not results:
+def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) -> List[Dict]:
+    """Perform semantic search using sentence embeddings."""
+    if not phenotypes or not model:
         return []
-    
-    # Create searchable text for each result
-    result_texts = [create_searchable_text(r) for r in results]
-    
-    # Encode query and results
-    query_embedding = st.session_state.embedding_model.encode([query])[0]
-    result_embeddings = st.session_state.embedding_model.encode(result_texts)
-    
-    # Calculate cosine similarity
-    similarities = np.dot(result_embeddings, query_embedding) / (
-        np.linalg.norm(result_embeddings, axis=1) * np.linalg.norm(query_embedding)
-    )
-    
-    # Add similarity scores and sort
-    for i, result in enumerate(results):
-        result['similarity_score'] = float(similarities[i])
-    
-    results_sorted = sorted(results, key=lambda x: x['similarity_score'], reverse=True)
-    return results_sorted[:top_k]
 
-def search_phenotypes(query: str, max_results: int = 50) -> List[Dict]:
-    """Search phenotypes with semantic reranking."""
     try:
-        # First get results from HDR UK API
-        api_results = list(client.phenotypes.get(search=query))
+        # Create searchable texts
+        phenotype_texts = [create_searchable_text(p) for p in phenotypes]
 
-        if not api_results:
+        # Encode
+        query_embedding = model.encode(query, convert_to_tensor=True)
+        phenotype_embeddings = model.encode(phenotype_texts, convert_to_tensor=True)
+
+        # Calculate cosine similarity
+        similarities = util.cos_sim(query_embedding, phenotype_embeddings)[0]
+
+        # Add scores and sort
+        results = []
+        for idx, phenotype in enumerate(phenotypes):
+            phenotype_copy = phenotype.copy()
+            phenotype_copy['similarity_score'] = float(similarities[idx])
+            results.append(phenotype_copy)
+
+        # Sort by similarity and return top k
+        results.sort(key=lambda x: x['similarity_score'], reverse=True)
+        return results[:top_k]
+
+    except Exception as e:
+        st.error(f"Error in semantic search: {str(e)}")
+        return phenotypes[:top_k]
+
+def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[Dict]:
+    """Search phenotypes with optional filters."""
+    try:
+        # Build search parameters
+        search_params = {'search': query}
+
+        if filters:
+            if filters.get('phenotype_type'):
+                search_params['phenotype_type'] = filters['phenotype_type']
+            if filters.get('collection_id'):
+                search_params['collections'] = filters['collection_id']
+
+        # Get results from API
+        results = list(client.phenotypes.get(**search_params))
+
+        if not results:
             return []
 
-        # Limit to max_results for semantic reranking
-        api_results = api_results[:max_results]
-        
-        # Rerank using semantic similarity
-        reranked = semantic_rerank(query, api_results, top_k=20)
-        
+        # Apply semantic reranking
+        reranked = semantic_search(query, results, model, top_k=30)
+
         return reranked
+
     except Exception as e:
         st.error(f"Error searching phenotypes: {str(e)}")
+        st.error(f"Details: {traceback.format_exc()}")
         return []
 
-def get_phenotype_detail(phenotype_id: str) -> Dict:
-    """Get full phenotype details."""
-    try:
-        return client.phenotypes.get_detail(phenotype_id)
-    except Exception as e:
-        st.error(f"Error fetching phenotype details: {str(e)}")
-        return {}
-
-def get_phenotype_codelist(phenotype_id: str) -> pd.DataFrame:
-    """Get codelist for a phenotype."""
+def get_phenotype_codelist(client, phenotype_id: str) -> Optional[pd.DataFrame]:
+    """Fetch codelist for a phenotype."""
     try:
         codes = client.phenotypes.get_codelist(phenotype_id)
         if codes:
-            return pd.DataFrame(codes)
-        return pd.DataFrame()
+            df = pd.DataFrame(codes)
+            return df
+        return None
     except Exception as e:
-        st.error(f"Error fetching codelist: {str(e)}")
-        return pd.DataFrame()
+        st.error(f"Error fetching codelist for {phenotype_id}: {str(e)}")
+        return None
 
-def download_phenotype(phenotype_id: str, phenotype_name: str):
-    """Create downloadable CSV for a phenotype."""
-    codelist = get_phenotype_codelist(phenotype_id)
-    
-    if not codelist.empty:
-        # Create CSV in memory
-        csv_buffer = io.StringIO()
-        codelist.to_csv(csv_buffer, index=False)
-        csv_str = csv_buffer.getvalue()
-        
-        # Create download button
+def download_button(df: pd.DataFrame, filename: str, label: str, key: str):
+    """Create a download button for a dataframe."""
+    if df is not None and not df.empty:
+        csv = df.to_csv(index=False)
         st.download_button(
-            label=f"📥 Download {phenotype_name}",
-            data=csv_str,
-            file_name=f"{phenotype_id}_{phenotype_name.replace(' ', '_')}.csv",
-            mime="text/csv",
-            key=f"download_{phenotype_id}"
+            label=label,
+            data=csv,
+            file_name=filename,
+            mime='text/csv',
+            key=key
         )
     else:
-        st.warning("No codes available for this phenotype")
+        st.warning("No data available for download")
 
-def combine_phenotypes(phenotype_ids: List[str], phenotype_names: List[str]) -> pd.DataFrame:
-    """Combine codelists from multiple phenotypes."""
-    combined_codes = []
-    
-    progress_bar = st.progress(0)
-    for i, (pid, pname) in enumerate(zip(phenotype_ids, phenotype_names)):
-        codelist = get_phenotype_codelist(pid)
-        if not codelist.empty:
-            codelist['source_phenotype_id'] = pid
-            codelist['source_phenotype_name'] = pname
-            combined_codes.append(codelist)
-        progress_bar.progress((i + 1) / len(phenotype_ids))
-    
-    if combined_codes:
-        combined_df = pd.concat(combined_codes, ignore_index=True)
-        # Remove duplicate codes
-        if 'code' in combined_df.columns:
-            combined_df = combined_df.drop_duplicates(subset=['code'], keep='first')
-        return combined_df
-    return pd.DataFrame()
+def display_phenotype_card(phenotype: Dict, idx: int):
+    """Display a single phenotype result card."""
+    phenotype_id = phenotype.get('phenotype_id', 'Unknown')
+    name = phenotype.get('name', 'Unnamed Phenotype')
+    similarity = phenotype.get('similarity_score', 0.0)
 
-# Search interface
+    # Color code similarity score
+    if similarity >= 0.7:
+        score_color = "🟢"
+    elif similarity >= 0.5:
+        score_color = "🟡"
+    else:
+        score_color = "🔴"
+
+    with st.expander(f"{score_color} **{name}** (ID: {phenotype_id}) - Match: {similarity:.1%}", expanded=False):
+        # Selection checkbox
+        is_selected = st.checkbox(
+            "Select for combination",
+            key=f"select_{phenotype_id}_{idx}",
+            value=phenotype_id in st.session_state.selected_phenotypes
+        )
+
+        if is_selected:
+            st.session_state.selected_phenotypes[phenotype_id] = name
+        else:
+            st.session_state.selected_phenotypes.pop(phenotype_id, None)
+
+        # Display metadata in columns
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**📋 Metadata**")
+            if phenotype.get('phenotype_type'):
+                st.markdown(f"- **Type:** {phenotype['phenotype_type']}")
+            if phenotype.get('coding_system'):
+                st.markdown(f"- **Coding System:** {phenotype['coding_system']}")
+            if phenotype.get('sex'):
+                st.markdown(f"- **Sex:** {phenotype['sex']}")
+            if phenotype.get('created'):
+                st.markdown(f"- **Created:** {phenotype['created'][:10]}")
+
+        with col2:
+            st.markdown("**👥 Authors & Collections**")
+            if phenotype.get('author'):
+                authors = phenotype['author']
+                if isinstance(authors, list):
+                    author_str = ', '.join(authors[:3])
+                    if len(authors) > 3:
+                        author_str += f" (+{len(authors)-3} more)"
+                    st.markdown(f"- **Authors:** {author_str}")
+
+            if phenotype.get('collections'):
+                collections = phenotype['collections']
+                if isinstance(collections, list) and len(collections) > 0:
+                    coll_names = []
+                    for c in collections[:2]:
+                        if isinstance(c, dict):
+                            coll_names.append(c.get('name', ''))
+                        elif isinstance(c, str):
+                            coll_names.append(c)
+                    if coll_names:
+                        st.markdown(f"- **Collections:** {', '.join(filter(None, coll_names))}")
+
+        # Description
+        if phenotype.get('description'):
+            st.markdown("**📝 Description**")
+            desc = phenotype['description']
+            if len(desc) > 300:
+                desc = desc[:300] + "..."
+            st.markdown(desc)
+
+        # Tags
+        if phenotype.get('tags'):
+            tags = phenotype['tags']
+            if isinstance(tags, list) and len(tags) > 0:
+                tag_str = ', '.join([f"`{t}`" for t in tags[:5]])
+                st.markdown(f"**🏷️ Tags:** {tag_str}")
+
+        # Action buttons
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            if st.button("📥 Download Codelist", key=f"dl_{phenotype_id}_{idx}"):
+                with st.spinner(f"Fetching codelist..."):
+                    client = get_hdr_client()
+                    if client:
+                        codelist = get_phenotype_codelist(client, phenotype_id)
+                        if codelist is not None and not codelist.empty:
+                            st.success(f"Found {len(codelist)} codes")
+                            st.dataframe(codelist.head(10), use_container_width=True)
+                            download_button(
+                                codelist,
+                                f"{phenotype_id}_codelist.csv",
+                                "💾 Save CSV",
+                                f"save_{phenotype_id}_{idx}"
+                            )
+                        else:
+                            st.warning("No codes found")
+
+        with col2:
+            if phenotype.get('url'):
+                st.link_button("🔗 View on Portal", phenotype['url'], key=f"link_{phenotype_id}_{idx}")
+
+        with col3:
+            if st.button("ℹ️ Full Details", key=f"details_{phenotype_id}_{idx}"):
+                with st.spinner("Loading details..."):
+                    client = get_hdr_client()
+                    if client:
+                        try:
+                            detail = client.phenotypes.get_detail(phenotype_id)
+                            st.json(detail)
+                        except Exception as e:
+                            st.error(f"Could not fetch details: {str(e)}")
+
+# Main App
+st.title("🔬 HDR UK Phenotype Library - Natural Language Search")
+st.markdown("""
+Search for clinical phenotypes using natural language queries.
+Find, compare, and download codelists from the [HDR UK Phenotype Library](https://phenotypes.healthdatagateway.org/).
+""")
+
+# Load resources
+with st.spinner("🔄 Initializing..."):
+    client = get_hdr_client()
+    model = load_embedding_model()
+
+if not client or not model:
+    st.error("⚠️ Failed to initialize. Please refresh the page or check your connection.")
+    st.stop()
+
+# Sidebar for filters and info
+with st.sidebar:
+    st.header("🔍 Search Filters")
+
+    phenotype_type_filter = st.selectbox(
+        "Phenotype Type",
+        ["All", "Disease or Syndrome", "Biomarker", "Lifestyle Risk Factor", "Physical Measurement"],
+        index=0
+    )
+
+    st.markdown("---")
+    st.header("ℹ️ About")
+    st.markdown("""
+    **Natural Language Search**
+    Uses semantic AI to understand your queries and find the most relevant phenotypes.
+
+    **Features:**
+    - 🤖 AI-powered semantic search
+    - 🎯 Match scoring for relevance
+    - 📊 View and download codelists
+    - 🔗 Combine multiple phenotypes
+    - 🏷️ Rich metadata display
+
+    **Usage Tips:**
+    - Use clinical terminology
+    - Be specific (e.g., "type 2 diabetes" not just "diabetes")
+    - Check match scores (🟢 High, 🟡 Medium, 🔴 Low)
+    - Select multiple phenotypes to combine codelists
+    """)
+
+    st.markdown("---")
+    st.markdown("**Examples:**")
+    st.code("type 2 diabetes mellitus")
+    st.code("myocardial infarction")
+    st.code("chronic kidney disease stage 3")
+    st.code("asthma in children")
+
+# Main search interface
 st.markdown("---")
-col1, col2 = st.columns([3, 1])
+st.header("🔎 Search Phenotypes")
+
+col1, col2 = st.columns([4, 1])
 
 with col1:
     query = st.text_input(
-        "🔍 Search for phenotypes",
-        placeholder="e.g., type 2 diabetes, myocardial infarction, chronic kidney disease",
-        help="Enter a natural language description of the phenotype you're looking for"
+        "Enter your search query",
+        placeholder="e.g., type 2 diabetes, heart failure, chronic obstructive pulmonary disease",
+        help="Describe the phenotype you're looking for in natural language",
+        label_visibility="collapsed"
     )
 
 with col2:
-    max_results = st.selectbox("Max results", [10, 20, 30, 50], index=1)
+    max_results = st.number_input("Max results", min_value=5, max_value=50, value=20, step=5)
 
-search_button = st.button("Search", type="primary", use_container_width=True)
+col1, col2, col3 = st.columns([1, 1, 2])
+
+with col1:
+    search_button = st.button("🔍 Search", type="primary", use_container_width=True)
+
+with col2:
+    if st.button("🔄 Clear", use_container_width=True):
+        st.session_state.search_results = []
+        st.session_state.selected_phenotypes = {}
+        st.session_state.last_query = ""
+        st.rerun()
 
 # Perform search
 if search_button and query:
-    with st.spinner('Searching phenotypes...'):
-        st.session_state.search_results = search_phenotypes(query, max_results=max_results)
-        st.session_state.selected_phenotypes = set()
+    st.session_state.last_query = query
+
+    with st.spinner(f"🔍 Searching for: **{query}**"):
+        filters = {}
+        if phenotype_type_filter != "All":
+            filters['phenotype_type'] = phenotype_type_filter
+
+        results = search_phenotypes(query, client, model, filters)
+        st.session_state.search_results = results[:max_results]
+        st.session_state.selected_phenotypes = {}
 
 # Display results
 if st.session_state.search_results:
     st.markdown("---")
-    st.subheader(f"Found {len(st.session_state.search_results)} phenotypes")
-    
-    # Action buttons
-    col1, col2, col3 = st.columns([1, 1, 2])
+
+    # Results header
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        if st.button("Clear Selection", use_container_width=True):
-            st.session_state.selected_phenotypes = set()
-            st.rerun()
+        st.subheader(f"📊 Found {len(st.session_state.search_results)} results")
     with col2:
-        if st.button("Select All", use_container_width=True):
-            st.session_state.selected_phenotypes = {r['phenotype_id'] for r in st.session_state.search_results}
+        if st.button("☑️ Select All", use_container_width=True):
+            for r in st.session_state.search_results:
+                st.session_state.selected_phenotypes[r['phenotype_id']] = r['name']
             st.rerun()
-    
-    # Display each result
-    for result in st.session_state.search_results:
-        phenotype_id = result['phenotype_id']
-        
-        with st.expander(
-            f"**{result['name']}** ({phenotype_id}) - Similarity: {result.get('similarity_score', 0):.3f}",
-            expanded=False
-        ):
-            # Checkbox for selection
-            is_selected = st.checkbox(
-                "Select this phenotype",
-                key=f"select_{phenotype_id}",
-                value=phenotype_id in st.session_state.selected_phenotypes
-            )
-            
-            if is_selected:
-                st.session_state.selected_phenotypes.add(phenotype_id)
-            else:
-                st.session_state.selected_phenotypes.discard(phenotype_id)
-            
-            # Display metadata
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**Type:** {result.get('phenotype_type', 'N/A')}")
-                st.markdown(f"**Coding System:** {result.get('coding_system', 'N/A')}")
-                if result.get('author'):
-                    st.markdown(f"**Authors:** {', '.join(result['author'][:3])}")
-            with col2:
-                if result.get('collections'):
-                    collection_names = []
-                    for c in result['collections'][:2]:
-                        if isinstance(c, dict):
-                            collection_names.append(c.get('name', ''))
-                        elif isinstance(c, str):
-                            collection_names.append(c)
-                    if collection_names:
-                        st.markdown(f"**Collections:** {', '.join(collection_names)}")
-                if result.get('data_sources'):
-                    st.markdown(f"**Data Sources:** {', '.join(result['data_sources'][:3])}")
-            
-            # Description
-            if result.get('description'):
-                st.markdown(f"**Description:** {result['description'][:300]}...")
-            
-            # Action buttons
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                download_phenotype(phenotype_id, result['name'])
-            with col2:
-                if st.button(f"View Full Details", key=f"details_{phenotype_id}"):
-                    detail = get_phenotype_detail(phenotype_id)
-                    st.json(detail)
-    
+    with col3:
+        if st.button("⬜ Clear Selection", use_container_width=True):
+            st.session_state.selected_phenotypes = {}
+            st.rerun()
+
+    # Display results
+    for idx, result in enumerate(st.session_state.search_results):
+        display_phenotype_card(result, idx)
+
     # Combine selected phenotypes
-    st.markdown("---")
-    st.subheader("Combine Selected Phenotypes")
-    
     if st.session_state.selected_phenotypes:
-        st.info(f"✅ {len(st.session_state.selected_phenotypes)} phenotype(s) selected")
-        
-        if st.button("🔗 Combine Selected Phenotypes", type="primary", use_container_width=True):
-            with st.spinner('Combining phenotypes...'):
-                selected_ids = list(st.session_state.selected_phenotypes)
-                selected_names = [
-                    r['name'] for r in st.session_state.search_results 
-                    if r['phenotype_id'] in selected_ids
-                ]
-                
-                combined_df = combine_phenotypes(selected_ids, selected_names)
-                
-                if not combined_df.empty:
-                    st.success(f"✅ Combined {len(combined_df)} unique codes from {len(selected_ids)} phenotypes")
-                    
-                    # Show statistics
-                    col1, col2, col3 = st.columns(3)
+        st.markdown("---")
+        st.header("🔗 Combine Selected Phenotypes")
+
+        st.info(f"✅ **{len(st.session_state.selected_phenotypes)} phenotype(s) selected**")
+
+        # Show selected
+        selected_names = list(st.session_state.selected_phenotypes.values())
+        with st.expander("View selected phenotypes"):
+            for pid, pname in st.session_state.selected_phenotypes.items():
+                st.markdown(f"- **{pname}** ({pid})")
+
+        if st.button("🔗 Combine Codelists", type="primary", use_container_width=True):
+            with st.spinner("Combining codelists..."):
+                combined_codes = []
+                progress_bar = st.progress(0)
+
+                for i, (pid, pname) in enumerate(st.session_state.selected_phenotypes.items()):
+                    codelist = get_phenotype_codelist(client, pid)
+                    if codelist is not None and not codelist.empty:
+                        codelist['source_phenotype_id'] = pid
+                        codelist['source_phenotype_name'] = pname
+                        combined_codes.append(codelist)
+                    progress_bar.progress((i + 1) / len(st.session_state.selected_phenotypes))
+
+                if combined_codes:
+                    combined_df = pd.concat(combined_codes, ignore_index=True)
+
+                    # Remove duplicates based on code
+                    if 'code' in combined_df.columns:
+                        original_count = len(combined_df)
+                        combined_df = combined_df.drop_duplicates(subset=['code'], keep='first')
+                        dedup_count = original_count - len(combined_df)
+
+                        st.success(f"✅ Combined {len(combined_df)} unique codes (removed {dedup_count} duplicates)")
+                    else:
+                        st.success(f"✅ Combined {len(combined_df)} codes")
+
+                    # Statistics
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.metric("Total Codes", len(combined_df))
                     with col2:
-                        st.metric("Source Phenotypes", len(selected_ids))
+                        st.metric("Source Phenotypes", len(st.session_state.selected_phenotypes))
                     with col3:
                         if 'coding_system' in combined_df.columns:
                             st.metric("Coding Systems", combined_df['coding_system'].nunique())
-                    
-                    # Display preview
-                    st.dataframe(combined_df.head(20), use_container_width=True)
-                    
-                    # Download combined
-                    csv_buffer = io.StringIO()
-                    combined_df.to_csv(csv_buffer, index=False)
-                    csv_str = csv_buffer.getvalue()
-                    
+                    with col4:
+                        if 'source_phenotype_id' in combined_df.columns:
+                            st.metric("Unique Sources", combined_df['source_phenotype_id'].nunique())
+
+                    # Preview
+                    st.dataframe(combined_df.head(50), use_container_width=True)
+
+                    # Download
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    st.download_button(
-                        label="📥 Download Combined Codelist",
-                        data=csv_str,
-                        file_name=f"combined_phenotypes_{timestamp}.csv",
-                        mime="text/csv",
-                        type="primary"
+                    download_button(
+                        combined_df,
+                        f"combined_phenotypes_{timestamp}.csv",
+                        "📥 Download Combined Codelist",
+                        f"download_combined_{timestamp}"
                     )
                 else:
-                    st.error("No codes found in selected phenotypes")
-    else:
-        st.info("Select phenotypes above to combine their codelists")
+                    st.error("❌ No codes found in selected phenotypes")
 
-# Sidebar with info
-with st.sidebar:
-    st.markdown("### About")
-    st.markdown("""
-    This tool searches the HDR UK Phenotype Library using natural language queries.
-    
-    **Features:**
-    - 🔍 Semantic search using BAAI/llm-embedder
-    - 📥 Download individual phenotype codelists
-    - 🔗 Combine multiple phenotypes into one codelist
-    - 📊 View metadata and statistics
-    
-    **Data Source:**
-    [HDR UK Phenotype Library](https://phenotypes.healthdatagateway.org/)
-    """)
-    
-    st.markdown("---")
-    st.markdown("### Usage Tips")
-    st.markdown("""
-    - Use clinical terms: "heart failure", "diabetes"
-    - Be specific: "type 2 diabetes" vs "diabetes"
-    - Check similarity scores for relevance
-    - Combine related phenotypes to create comprehensive codelists
-    """)
+elif st.session_state.last_query:
+    st.info(f"No results found for: **{st.session_state.last_query}**. Try different search terms.")
+else:
+    st.info("👆 Enter a search query above to get started")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #6c757d; font-size: 0.875rem;'>
+    Data from <a href='https://phenotypes.healthdatagateway.org/' target='_blank'>HDR UK Phenotype Library</a> |
+    Powered by <a href='https://github.com/SwanseaUniversityMedical/pyconceptlibraryclient' target='_blank'>pyconceptlibraryclient</a>
+</div>
+""", unsafe_allow_html=True)

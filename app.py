@@ -79,6 +79,10 @@ def get_hdr_client():
 
 def create_searchable_text(phenotype: Dict) -> str:
     """Create rich text for semantic search from phenotype metadata."""
+    # Type check: ensure phenotype is a dictionary
+    if not isinstance(phenotype, dict):
+        return ""
+
     parts = []
 
     # Core fields
@@ -125,8 +129,15 @@ def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) 
         return []
 
     try:
+        # Filter to ensure all items are dictionaries
+        valid_phenotypes = [p for p in phenotypes if isinstance(p, dict)]
+
+        if not valid_phenotypes:
+            st.warning("No valid phenotype dictionaries found for semantic search")
+            return []
+
         # Create searchable texts
-        phenotype_texts = [create_searchable_text(p) for p in phenotypes]
+        phenotype_texts = [create_searchable_text(p) for p in valid_phenotypes]
 
         # Encode
         query_embedding = model.encode(query, convert_to_tensor=True)
@@ -137,7 +148,7 @@ def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) 
 
         # Add scores and sort
         results = []
-        for idx, phenotype in enumerate(phenotypes):
+        for idx, phenotype in enumerate(valid_phenotypes):
             phenotype_copy = phenotype.copy()
             phenotype_copy['similarity_score'] = float(similarities[idx])
             results.append(phenotype_copy)
@@ -148,13 +159,13 @@ def semantic_search(query: str, phenotypes: List[Dict], model, top_k: int = 30) 
 
     except Exception as e:
         st.error(f"Error in semantic search: {str(e)}")
-        return phenotypes[:top_k]
+        return valid_phenotypes[:top_k] if valid_phenotypes else []
 
 def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[Dict]:
     """Search phenotypes with optional filters."""
     try:
         # Build search parameters
-        search_params = {'search': query}
+        search_params = {'search': query, 'no_pagination': True}
 
         if filters:
             if filters.get('phenotype_type'):
@@ -163,13 +174,26 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
                 search_params['collections'] = filters['collection_id']
 
         # Get results from API
-        results = list(client.phenotypes.get(**search_params))
+        # With no_pagination=True, the API returns a list of phenotype dictionaries directly
+        results = client.phenotypes.get(**search_params)
 
+        # Validate results
         if not results:
             return []
 
+        if not isinstance(results, list):
+            st.error(f"Unexpected API response type: {type(results)}. Expected list.")
+            return []
+
+        # Filter to ensure all items are dictionaries
+        valid_results = [r for r in results if isinstance(r, dict)]
+
+        if not valid_results:
+            st.warning("No valid phenotype objects found in API response")
+            return []
+
         # Apply semantic reranking
-        reranked = semantic_search(query, results, model, top_k=30)
+        reranked = semantic_search(query, valid_results, model, top_k=30)
 
         return reranked
 
@@ -206,6 +230,11 @@ def download_button(df: pd.DataFrame, filename: str, label: str, key: str):
 
 def display_phenotype_card(phenotype: Dict, idx: int):
     """Display a single phenotype result card."""
+    # Type check: ensure phenotype is a dictionary
+    if not isinstance(phenotype, dict):
+        st.error(f"Invalid phenotype data type: {type(phenotype)}. Expected dictionary.")
+        return
+
     phenotype_id = phenotype.get('phenotype_id', 'Unknown')
     name = phenotype.get('name', 'Unnamed Phenotype')
     similarity = phenotype.get('similarity_score', 0.0)
@@ -425,7 +454,8 @@ if st.session_state.search_results:
     with col2:
         if st.button("☑️ Select All", use_container_width=True):
             for r in st.session_state.search_results:
-                st.session_state.selected_phenotypes[r['phenotype_id']] = r['name']
+                if isinstance(r, dict) and 'phenotype_id' in r and 'name' in r:
+                    st.session_state.selected_phenotypes[r['phenotype_id']] = r['name']
             st.rerun()
     with col3:
         if st.button("⬜ Clear Selection", use_container_width=True):

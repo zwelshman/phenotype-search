@@ -217,7 +217,14 @@ if st.session_state.search_results:
                     st.markdown(f"**Authors:** {', '.join(result['author'][:3])}")
             with col2:
                 if result.get('collections'):
-                    st.markdown(f"**Collections:** {', '.join([c.get('name', '') for c in result['collections'][:2]])}")
+                    collection_names = []
+                    for c in result['collections'][:2]:
+                        if isinstance(c, dict):
+                            collection_names.append(c.get('name', ''))
+                        elif isinstance(c, str):
+                            collection_names.append(c)
+                    if collection_names:
+                        st.markdown(f"**Collections:** {', '.join(collection_names)}")
                 if result.get('data_sources'):
                     st.markdown(f"**Data Sources:** {', '.join(result['data_sources'][:3])}")
             

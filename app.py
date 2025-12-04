@@ -54,6 +54,8 @@ def init_session_state():
         st.session_state.all_phenotypes = None
     if 'last_query' not in st.session_state:
         st.session_state.last_query = ""
+    if 'expanded_phenotypes' not in st.session_state:
+        st.session_state.expanded_phenotypes = set()
 
 init_session_state()
 
@@ -247,7 +249,13 @@ def display_phenotype_card(phenotype: Dict, idx: int):
     else:
         score_color = "🔴"
 
-    with st.expander(f"{score_color} **{name}** (ID: {phenotype_id}) - Match: {similarity:.1%}", expanded=False):
+    # Create unique key for this phenotype's expander state
+    expander_key = f"{phenotype_id}_{idx}"
+
+    # Check if this phenotype should be expanded
+    is_expanded = expander_key in st.session_state.expanded_phenotypes
+
+    with st.expander(f"{score_color} **{name}** (ID: {phenotype_id}) - Match: {similarity:.1%}", expanded=is_expanded):
         # Selection checkbox
         is_selected = st.checkbox(
             "Select for combination",
@@ -317,6 +325,8 @@ def display_phenotype_card(phenotype: Dict, idx: int):
 
         with col1:
             if st.button("📥 Download Codelist", key=f"dl_{phenotype_id}_{idx}"):
+                # Keep expander open
+                st.session_state.expanded_phenotypes.add(expander_key)
                 with st.spinner(f"Fetching codelist..."):
                     client = get_hdr_client()
                     if client:
@@ -339,12 +349,17 @@ def display_phenotype_card(phenotype: Dict, idx: int):
 
         with col3:
             if st.button("ℹ️ Full Details", key=f"details_{phenotype_id}_{idx}"):
+                # Keep expander open
+                st.session_state.expanded_phenotypes.add(expander_key)
                 with st.spinner("Loading details..."):
                     client = get_hdr_client()
                     if client:
                         try:
                             detail = client.phenotypes.get_detail(phenotype_id)
-                            st.json(detail)
+                            # Display full details in an expandable container for better layout
+                            with st.container():
+                                st.markdown("**Full Phenotype Details:**")
+                                st.json(detail)
                         except Exception as e:
                             st.error(f"Could not fetch details: {str(e)}")
 
@@ -428,6 +443,7 @@ with col2:
         st.session_state.search_results = []
         st.session_state.selected_phenotypes = {}
         st.session_state.last_query = ""
+        st.session_state.expanded_phenotypes = set()
         st.rerun()
 
 # Perform search
@@ -442,6 +458,7 @@ if search_button and query:
         results = search_phenotypes(query, client, model, filters)
         st.session_state.search_results = results[:max_results]
         st.session_state.selected_phenotypes = {}
+        st.session_state.expanded_phenotypes = set()
 
 # Display results
 if st.session_state.search_results:

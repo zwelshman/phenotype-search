@@ -165,7 +165,7 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
     """Search phenotypes with optional filters."""
     try:
         # Build search parameters
-        search_params = {'search': query}
+        search_params = {'search': query, 'no_pagination': True}
 
         if filters:
             if filters.get('phenotype_type'):
@@ -174,38 +174,26 @@ def search_phenotypes(query: str, client, model, filters: Dict = None) -> List[D
                 search_params['collections'] = filters['collection_id']
 
         # Get results from API
-        raw_results = list(client.phenotypes.get(**search_params))
+        # With no_pagination=True, the API returns a list of phenotype dictionaries directly
+        results = client.phenotypes.get(**search_params)
 
-        if not raw_results:
+        # Validate results
+        if not results:
             return []
 
-        # Convert results to list of dictionaries
-        # The API might return strings (IDs) or dict objects
-        results = []
-        for item in raw_results:
-            if isinstance(item, dict):
-                # Already a dictionary, use it directly
-                results.append(item)
-            elif isinstance(item, str):
-                # If it's a string (phenotype ID), fetch the full details
-                try:
-                    detail = client.phenotypes.get_detail(item)
-                    if detail and isinstance(detail, dict):
-                        results.append(detail)
-                except Exception as e:
-                    st.warning(f"Could not fetch details for {item}: {str(e)}")
-                    continue
-            else:
-                # Unknown type, skip it
-                st.warning(f"Unexpected result type: {type(item)}")
-                continue
+        if not isinstance(results, list):
+            st.error(f"Unexpected API response type: {type(results)}. Expected list.")
+            return []
 
-        if not results:
+        # Filter to ensure all items are dictionaries
+        valid_results = [r for r in results if isinstance(r, dict)]
+
+        if not valid_results:
             st.warning("No valid phenotype objects found in API response")
             return []
 
         # Apply semantic reranking
-        reranked = semantic_search(query, results, model, top_k=30)
+        reranked = semantic_search(query, valid_results, model, top_k=30)
 
         return reranked
 
